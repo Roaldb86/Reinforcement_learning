@@ -4,7 +4,14 @@ from collections import defaultdict
 
 class Agent:
 
-    def __init__(self, nA=6, alpha=0.20, epsilon_max=1, epsilon_min=0.00005, eps_decay=0.999):
+    def __init__(self,
+                 nA=6,
+                 alpha=0.20,
+                 epsilon_max=1,
+                 epsilon_min=0.00005,
+                 eps_decay=0.999,
+                 gamma=0.95
+                 ):
         """ Initialize agent.
 
         Params
@@ -17,8 +24,9 @@ class Agent:
         self.epsilon_min = epsilon_min
         self.eps_decay = eps_decay
         self.epsilon = epsilon_max
+        self.gamma = gamma
 
-    def get_probs(self, state, eps=None):
+    def get_probs(self, state,  eps=None):
         self.epsilon = max(self.epsilon * self.eps_decay, self.epsilon_min)
         if eps:
             self.epsilon = eps
@@ -59,6 +67,7 @@ class Agent:
         probs = self.get_probs(state)
 
         if not done:
-            self.Q[state][action] += self.alpha * (reward + np.dot(self.Q[next_state], probs) - self.Q[state][action])
+            self.Q[state][action] += self.alpha * (
+                        reward + self.gamma * (np.dot(self.Q[next_state], probs)) - self.Q[state][action])
         else:
             self.Q[state][action] += self.alpha * (reward - self.Q[state][action])
