@@ -5,6 +5,7 @@ import random
 import torch
 import torch.nn.functional as F
 import torch.optim as optim
+from torch.optim.lr_scheduler import StepLR
 
 from models import QNetwork
 from utilities import hash_state, discretize, create_uniform_grid
@@ -172,9 +173,9 @@ class RandomAgent:
 BUFFER_SIZE = int(1e5)  # replay buffer size
 BATCH_SIZE = 64  # minibatch size
 GAMMA = 0.9  # discount factor
-TAU = 0.001  # for soft update of target parameters
-LR = 0.001  # learning rate
-UPDATE_EVERY = 10  # how often to update the network
+TAU = 1e-3 # for soft update of target parameters
+LR = 0.01  # learning rate
+UPDATE_EVERY = 1  # how often to update the network
 
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
@@ -187,7 +188,7 @@ class DQNAgent():
                  action_size,
                  seed=42,
                  epsilon=1,
-                 epsilon_min=0.1,
+                 epsilon_min=0.05,
                  eps_decay=0.9999
                  ):
         """Initialize an Agent object.
@@ -210,6 +211,7 @@ class DQNAgent():
         self.qnetwork_local = QNetwork(state_size, action_size, seed).to(device)
         self.qnetwork_target = QNetwork(state_size, action_size, seed).to(device)
         self.optimizer = optim.Adam(self.qnetwork_local.parameters(), lr=LR)
+        self.scheduler = StepLR(self.optimizer, step_size=1, gamma=0.999)
 
         # Replay memory
         self.memory = ReplayBuffer(action_size, BUFFER_SIZE, BATCH_SIZE, seed)
@@ -237,6 +239,8 @@ class DQNAgent():
             state (array_like): current state
         """
         self.epsilon = max(self.epsilon*self.eps_decay, self.epsilon_min)
+        self.scheduler.step()
+
         state = torch.from_numpy(state).float().unsqueeze(0).to(device)
         self.qnetwork_local.eval()
         with torch.no_grad():

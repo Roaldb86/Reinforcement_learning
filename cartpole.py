@@ -7,7 +7,7 @@ from agents import QAgent, Agent, RandomAgent, DQNAgent
 env = gym.make('CartPole-v0')
 
 num_episodes = 10000
-print_evry= 500
+print_evry= 100
 
 #agent = Agent(0.1, 1, 1, 0.1, 0.999, env.action_space.n)
 #agent = RandomAgent(env.action_space.n)
@@ -32,8 +32,14 @@ for episode in range(num_episodes):
 
     # monitor progress
     if episode % print_evry == 0:
-        print(f"Episode {episode}/{num_episodes}, reward:{int(np.mean(average_reward[-99:]))}")
-        #sys.st_out.flush()
+        reward_last_100 = int(np.mean(average_reward[-99:]))
+        learning_rate = agent.scheduler.get_lr().squeeze()
+        print(f"Episode {episode}/{num_episodes},eps:{agent.epsilon:.3f}, lr: {learning_rate}, reward:{reward_last_100}")
+
+        if reward_last_100 >= 195:
+            print(f"Solved in {episode} epsiodes")
+            break
+
 
 
 
