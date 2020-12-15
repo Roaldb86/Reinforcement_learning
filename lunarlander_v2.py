@@ -16,7 +16,6 @@ for episode in range(num_episodes):
     rewards = []
     state = env.reset()
 
-
     while True:
         action = agent.act(state)
         next_state, reward, done, info = env.step(action)
@@ -28,9 +27,8 @@ for episode in range(num_episodes):
             average_reward.append(np.sum(rewards))
             break
 
-#
-
     # monitor progress
-    if episode % 500 == 0:
-        print(f"Episode {episode}/{num_episodes}, reward:{int(np.mean(average_reward[-99:]))}")
-        #sys.st_out.flush()
+    if episode % print_evry == 0:
+        reward_last_100 = int(np.mean(average_reward[-99:]))
+        learning_rate = agent.scheduler.get_lr().squeeze()
+        print(f"Episode {episode}/{num_episodes},eps:{agent.epsilon:.3f}, lr: {learning_rate}, reward:{reward_last_100}")

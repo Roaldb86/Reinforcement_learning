@@ -1,6 +1,7 @@
 from collections import defaultdict, namedtuple, deque
 import numpy as np
 import random
+import math
 
 import torch
 import torch.nn.functional as F
@@ -9,6 +10,7 @@ from torch.optim.lr_scheduler import StepLR
 
 from models import QNetwork
 from utilities import hash_state, discretize, create_uniform_grid
+from replay_buffer import PrioritizedReplayBuffer, ReplayBuffer
 
 class Agent:
     def __init__(self, alpha, gamma, epsilon, epsilon_min, eps_decay, nA):
@@ -170,26 +172,38 @@ class RandomAgent:
         pass
 
 
-BUFFER_SIZE = int(1e5)  # replay buffer size
-BATCH_SIZE = 64  # minibatch size
-GAMMA = 0.9  # discount factor
-TAU = 1e-3 # for soft update of target parameters
-LR = 0.01  # learning rate
-UPDATE_EVERY = 1  # how often to update the network
+BUFFER_SIZE = int(1e5)      # replay buffer size
+BATCH_SIZE = 64             # minibatch size
+GAMMA = 0.99                # discount factor
+TAU = 1e-3                  # for soft update of target parameters
+LR = 1e-1                   # learning rate
+UPDATE_NN_EVERY = 1        # how often to update the network
+
+
 
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
 
-class DQNAgent():
+class PrioritizedDQNAgent():
     """Interacts with and learns from the environment."""
 
     def __init__(self,
                  state_size,
                  action_size,
+                 buffer_size,
+                 batch_size,
+                 gamma,
+                 tau,
+                 lr,
+                 update_every,
+                 update_mem_every,
+                 update_mem_par_every,
+                 experience_per_sampling,
                  seed=42,
                  epsilon=1,
-                 epsilon_min=0.05,
-                 eps_decay=0.9999
+                 epsilon_min=0.01,
+                 eps_decay=0.999,
+                 compute_weights=False
                  ):
         """Initialize an Agent object.
 
@@ -201,35 +215,60 @@ class DQNAgent():
         """
         self.state_size = state_size
         self.action_size = action_size
+        self.buffer_size = buffer_size
+        self.batch_size = batch_size
+        self.gamma = gamma
+        self.tau = tau
+        self.update_every = update_every
+        self.experience_per_sampling  = experience_per_sampling
+        self.update_mem_every = update_mem_every
+        self.update_mem_par_every = update_mem_par_every
         self.seed = random.seed(seed)
         self.learn_steps = 0
         self.epsilon = epsilon
         self.epsilon_min = epsilon_min
         self.eps_decay = eps_decay
+        self.compute_weights = compute_weights
 
         # Q-Network
         self.qnetwork_local = QNetwork(state_size, action_size, seed).to(device)
         self.qnetwork_target = QNetwork(state_size, action_size, seed).to(device)
-        self.optimizer = optim.Adam(self.qnetwork_local.parameters(), lr=LR)
-        self.scheduler = StepLR(self.optimizer, step_size=1, gamma=0.999)
+        self.optimizer = optim.Adam(self.qnetwork_local.parameters(), lr=lr)
+        #self.scheduler = StepLR(self.optimizer, step_size=1, gamma=0.9999, eta_min=0.0005)
+
 
         # Replay memory
-        self.memory = ReplayBuffer(action_size, BUFFER_SIZE, BATCH_SIZE, seed)
-        # Initialize time step (for updating every UPDATE_EVERY steps)
-        self.t_step = 0
+        self.memory = PrioritizedReplayBuffer(
+                    self.action_size,
+                    self.buffer_size,
+                    self.batch_size,
+                    self.experience_per_sampling,
+                    self.seed,
+                    self.compute_weights)
+        # Initialize time step (for updating every UPDATE_NN_EVERY steps)
+        self.t_step_nn = 0
+        # Initialize time step (for updating every UPDATE_MEM_PAR_EVERY steps)
+        self.t_step_mem_par = 0
+        # Initialize time step (for updating every UPDATE_MEM_EVERY steps)
+        self.t_step_mem = 0
 
-
-    def step(self, state, action, reward, next_state,  done):
+    def step(self, state, action, reward, next_state, done):
         # Save experience in replay memory
         self.memory.add(state, action, reward, next_state, done)
 
-        # Learn every UPDATE_EVERY time steps.
-        self.t_step = (self.t_step + 1) % UPDATE_EVERY
-        if self.t_step == 0:
+        # Learn every UPDATE_NN_EVERY time steps.
+        self.t_step_nn = (self.t_step_nn + 1) % self.update_every
+        self.t_step_mem = (self.t_step_mem + 1) % self.update_mem_every
+        self.t_step_mem_par = (self.t_step_mem_par + 1) % self.update_mem_par_every
+        if self.t_step_mem_par == 0:
+            self.memory.update_parameters()
+        if self.t_step_nn == 0:
             # If enough samples are available in memory, get random subset and learn
-            if len(self.memory) > BATCH_SIZE:
-                experiences = self.memory.sample()
-                self.learn(experiences, GAMMA)
+            if self.memory.experience_count > self.experience_per_sampling:
+                sampling = self.memory.sample()
+                self.learn(sampling)
+        if self.t_step_mem == 0:
+            self.memory.update_memory_sampling()
 
     def act(self, state):
         """Returns actions for given state as per current policy.
@@ -239,7 +278,6 @@ class DQNAgent():
             state (array_like): current state
         """
         self.epsilon = max(self.epsilon*self.eps_decay, self.epsilon_min)
-        self.scheduler.step()
 
         state = torch.from_numpy(state).float().unsqueeze(0).to(device)
         self.qnetwork_local.eval()
@@ -255,9 +293,141 @@ class DQNAgent():
         else:
             return random.choice(np.arange(self.action_size))
 
-    def learn(self, experiences, gamma):
+    def learn(self, sampling):
         """Update value parameters using given batch of experience tuples.
+        Params
+        ======
+            sampling (Tuple[torch.Tensor]): tuple of (s, a, r, s', done) tuples
+            gamma (float): discount factor
+        """
+        states, actions, rewards, next_states, dones, weights, indices  = sampling
 
+        # Get max predicted Q values (for next states) from target model
+        Q_targets_next = self.qnetwork_target(next_states).detach().max(1)[0].unsqueeze(1)
+        # Compute Q targets for current states
+        Q_targets = rewards + (self.gamma * Q_targets_next * (1 - dones))
+
+        # Get expected Q values from local model
+        Q_expected = self.qnetwork_local(states).gather(1, actions)
+
+        # Compute loss
+        loss = F.mse_loss(Q_expected, Q_targets)
+
+        if self.compute_weights:
+            with torch.no_grad():
+                weight = sum(np.multiply(weights, loss.data.cpu().numpy()))
+            loss *= weight
+
+        # Minimize the loss
+        self.optimizer.zero_grad()
+        loss.backward()
+        self.optimizer.step()
+        #self.scheduler.step()
+        self.learn_steps += 1
+
+        # ------------------- update target network ------------------- #
+        self.soft_update(self.qnetwork_local, self.qnetwork_target)
+
+        # ------------------- update priorities ------------------- #
+        delta = abs(Q_targets - Q_expected.detach()).numpy()
+        self.memory.update_priorities(delta, indices)
+
+    def soft_update(self, local_model, target_model):
+        """Soft update model parameters.
+        θ_target = τ*θ_local + (1 - τ)*θ_target
+
+        Params
+        ======
+            local_model (PyTorch model): weights will be copied from
+            target_model (PyTorch model): weights will be copied to
+            tau (float): interpolation parameter
+        """
+        for target_param, local_param in zip(target_model.parameters(), local_model.parameters()):
+            target_param.data.copy_(self.tau * local_param.data + (1.0 - self.tau) * target_param.data)
+
+
+class DQNAgent():
+    """Interacts with and learns from the environment."""
+
+    def __init__(self,
+                 state_size,
+                 action_size,
+                 buffer_size,
+                 batch_size,
+                 gamma,
+                 tau,
+                 lr,
+                 update_every,
+                 seed=22,
+                 epsilon=1,
+                 epsilon_min=0.05,
+                 eps_decay=0.99
+                 ):
+        """Initialize an Agent object.
+        Params
+        ======
+            state_size (int): dimension of each state
+            action_size (int): dimension of each action
+            seed (int): random seed
+        """
+        self.state_size = state_size
+        self.action_size = action_size
+        self.buffer_size = buffer_size
+        self.batch_size = batch_size
+        self.gamma = gamma
+        self.tau = tau
+        self.lr = lr
+        self.update_every = update_every
+        self.seed = random.seed(seed)
+        self.learn_steps = 0
+        self.epsilon = epsilon
+        self.epsilon_min = epsilon_min
+        self.eps_decay = eps_decay
+
+        # Q-Network
+        self.qnetwork_local = QNetwork(state_size, action_size, seed).to(device)
+        self.qnetwork_target = QNetwork(state_size, action_size, seed).to(device)
+        self.optimizer = optim.Adam(self.qnetwork_local.parameters(), lr=lr)
+
+        # Replay memory
+        self.memory = ReplayBuffer(self.action_size, self.buffer_size, self.batch_size, self.seed)
+        # Initialize time step (for updating every UPDATE_EVERY steps)
+        self.t_step = 0
+
+
+    def step(self, state, action, reward, next_state,  done):
+        # Save experience in replay memory
+        self.memory.add(state, action, reward, next_state, done)
+
+        # Learn every UPDATE_EVERY time steps.
+        self.t_step = (self.t_step + 1) % self.update_every
+        if self.t_step == 0:
+            # sample
+            experiences = self.memory.sample()
+            self.learn(experiences)
+
+    def act(self, state):
+        """Returns actions for given state as per current policy.
+        Params
+        ======
+            state (array_like): current state
+        """
+        self.epsilon = max(self.epsilon*self.eps_decay, self.epsilon_min)
+
+        state = torch.from_numpy(state).float().unsqueeze(0).to(device)
+        self.qnetwork_local.eval()
+        with torch.no_grad():
+            action_values = self.qnetwork_local(state)
+        self.qnetwork_local.train()
+
+        # Epsilon-greedy action selection
+        if random.random() > self.epsilon:
+            return np.argmax(action_values.cpu().data.numpy())
+        else:
+            return random.choice(np.arange(self.action_size))
+
+    def learn(self, experiences):
+        """Update value parameters using given batch of experience tuples.
         Params
         ======
             experiences (Tuple[torch.Variable]): tuple of (s, a, r, s', done) tuples
@@ -268,7 +438,7 @@ class DQNAgent():
         # Get max predicted Q values (for next states) from target model
         Q_targets_next = self.qnetwork_target(next_states).detach().max(1)[0].unsqueeze(1)
         # Compute Q targets for current states
-        Q_targets = rewards + (gamma * Q_targets_next * (1 - dones))
+        Q_targets = rewards + (self.gamma * Q_targets_next * (1 - dones))
 
         # Get expected Q values from local model
         Q_expected = self.qnetwork_local(states).gather(1, actions)
@@ -282,12 +452,11 @@ class DQNAgent():
         self.learn_steps += 1
 
         # ------------------- update target network ------------------- #
-        self.soft_update(self.qnetwork_local, self.qnetwork_target, TAU)
+        self.soft_update(self.qnetwork_local, self.qnetwork_target)
 
-    def soft_update(self, local_model, target_model, tau):
+    def soft_update(self, local_model, target_model):
         """Soft update model parameters.
         θ_target = τ*θ_local + (1 - τ)*θ_target
-
         Params
         ======
             local_model (PyTorch model): weights will be copied from
@@ -295,47 +464,4 @@ class DQNAgent():
             tau (float): interpolation parameter
         """
         for target_param, local_param in zip(target_model.parameters(), local_model.parameters()):
-            target_param.data.copy_(tau * local_param.data + (1.0 - tau) * target_param.data)
-
-
-class ReplayBuffer:
-    """Fixed-size buffer to store experience tuples."""
-
-    def __init__(self, action_size, buffer_size, batch_size, seed):
-        """Initialize a ReplayBuffer object.
-
-        Params
-        ======
-            action_size (int): dimension of each action
-            buffer_size (int): maximum size of buffer
-            batch_size (int): size of each training batch
-            seed (int): random seed
-        """
-        self.action_size = action_size
-        self.memory = deque(maxlen=buffer_size)
-        self.batch_size = batch_size
-        self.experience = namedtuple("Experience", field_names=["state", "action", "reward", "next_state", "done"])
-        self.seed = random.seed(seed)
-
-    def add(self, state, action, reward, next_state, done):
-        """Add a new experience to memory."""
-        e = self.experience(state, action, reward, next_state, done)
-        self.memory.append(e)
-
-    def sample(self):
-        """Randomly sample a batch of experiences from memory."""
-        experiences = random.sample(self.memory, k=self.batch_size)
-
-        states = torch.from_numpy(np.vstack([e.state for e in experiences if e is not None])).float().to(device)
-        actions = torch.from_numpy(np.vstack([e.action for e in experiences if e is not None])).long().to(device)
-        rewards = torch.from_numpy(np.vstack([e.reward for e in experiences if e is not None])).float().to(device)
-        next_states = torch.from_numpy(np.vstack([e.next_state for e in experiences if e is not None])).float().to(
-            device)
-        dones = torch.from_numpy(np.vstack([e.done for e in experiences if e is not None]).astype(np.uint8)).float().to(
-            device)
-
-        return (states, actions, rewards, next_states, dones)
-
-    def __len__(self):
-        """Return the current size of internal memory."""
-        return len(self.memory)
+            target_param.data.copy_(self.tau * local_param.data + (1.0 - self.tau) * target_param.data)
