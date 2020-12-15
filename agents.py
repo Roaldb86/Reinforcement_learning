@@ -172,15 +172,6 @@ class RandomAgent:
         pass
 
 
-BUFFER_SIZE = int(1e5)      # replay buffer size
-BATCH_SIZE = 64             # minibatch size
-GAMMA = 0.99                # discount factor
-TAU = 1e-3                  # for soft update of target parameters
-LR = 1e-1                   # learning rate
-UPDATE_NN_EVERY = 1        # how often to update the network
-
-
-
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
 
@@ -199,7 +190,7 @@ class PrioritizedDQNAgent():
                  update_mem_every,
                  update_mem_par_every,
                  experience_per_sampling,
-                 seed=42,
+                 seed=25,
                  epsilon=1,
                  epsilon_min=0.01,
                  eps_decay=0.999,
@@ -234,7 +225,7 @@ class PrioritizedDQNAgent():
         self.qnetwork_local = QNetwork(state_size, action_size, seed).to(device)
         self.qnetwork_target = QNetwork(state_size, action_size, seed).to(device)
         self.optimizer = optim.Adam(self.qnetwork_local.parameters(), lr=lr)
-        #self.scheduler = StepLR(self.optimizer, step_size=1, gamma=0.9999, eta_min=0.0005)
+        self.scheduler = StepLR(self.optimizer, step_size=1, gamma=0.995)
 
 
         # Replay memory
@@ -322,7 +313,7 @@ class PrioritizedDQNAgent():
         self.optimizer.zero_grad()
         loss.backward()
         self.optimizer.step()
-        #self.scheduler.step()
+        self.scheduler.step()
         self.learn_steps += 1
 
         # ------------------- update target network ------------------- #
